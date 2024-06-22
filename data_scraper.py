@@ -1,54 +1,94 @@
 from typing import List
 import os
-
-import azure.storage.blob
+import io
+import pprint
+import zipfile
+import json
+import threading
 from azure.storage.blob import BlobServiceClient
 from datetime import datetime, timedelta
 from market_enum import Market
 from stream_type_enum import StreamType
-import threading
-
+import time
 
 class DataScaper:
-    def __init__(self):
+    def __init__(
+            self,
+            blob_connection_string: str,
+            container_name: str,
+            single_file_duration_seconds: int,
+            download_raw_jsons: bool = False
+    ):
+        self.blob_service_client = BlobServiceClient.from_connection_string(blob_connection_string)
+        self.container_client = self.blob_service_client.get_container_client(container_name)
+        self.container_name = container_name
+        self.download_raw_jsons_indicator = download_raw_jsons
+        self.single_file_duration_seconds = single_file_duration_seconds
         self.threads = []
 
     def download_daemon(self, download_directory: str, from_date: str, to_date: str, pair: str,
-                        market: Market, stream_type: StreamType, blob_connection_string: str, container_name: str,
-                        file_duration_seconds: int | None = 60 * 30) -> None:
+                        market: Market, stream_type: StreamType) -> None:
 
-        blob_service_client = BlobServiceClient.from_connection_string(blob_connection_string)
+        for target_date in self._return_date_list(from_date, to_date):
+            desired_blob_list = self.get_blob_list_for_date(pair, target_date, market, stream_type)
+            exact_directory = self._get_exact_download_directory(download_directory, market, stream_type, pair)
+            print(f'blob_list for: {target_date}')
+            pprint.pprint(desired_blob_list)
 
-        container_client = blob_service_client.get_container_client(container_name)
+            for file_name in desired_blob_list:
+                blob_client = self.blob_service_client.get_blob_client(container=self.container_name, blob=blob_name)
+                blob_data = blob_client.download_blob().readall()
 
-        query_result = self.get_blob_list(pair, container_client, from_date, to_date, market, stream_type)
+                with zipfile.ZipFile(io.BytesIO(blob_data)) as z:
+                    for file_name in z.namelist():
+                        with z.open(file_name) as json_file:
+                            json_data = json.load(json_file)
+                            return json_data
 
-        sub_market_stream_type_download_directory = (f'{download_directory}/{market.name.lower()}/'
-                                                     f'{stream_type.name.lower()}')
-
-        if not os.path.exists(sub_market_stream_type_download_directory):
-            os.makedirs(sub_market_stream_type_download_directory)
-
-        for file_name in query_result:
-            self.download_blob(blob_service_client, container_name, blob_name=file_name,
-                               download_file_path=f'{sub_market_stream_type_download_directory}/{file_name}')
-
-    def get_blob_list(self, pair: str, container_client: azure.storage.blob.ContainerClient, from_date: str,
-                      to_date: str, market: Market, stream_type: StreamType) -> List[str]:
+    def get_blob_list_for_date(self, pair: str, target_date: str, market: Market, stream_type: StreamType) -> List[str]:
 
         prefix = self._get_file_name_prefix(pair, market, stream_type)
+        from_date_minus_one_day = self.str_date_timedelta(target_date, timedelta(days=-1))
 
         blob_list = []
 
-        for date in self._return_date_list(from_date.split('T')[0], to_date.split('T')[0]):
-            single_day_blob_list = container_client.list_blobs(name_starts_with=f'{prefix}_{date}')
+        for date in self._return_date_list(from_date_minus_one_day, target_date):
+            single_day_blob_list = self.container_client.list_blobs(name_starts_with=f'{prefix}_{date}')
             single_day_blob_list = [blob.name for blob in single_day_blob_list]
-            for _ in single_day_blob_list:
-                blob_list.append(_)
+            for blob_name in single_day_blob_list:
+                json = self.download_and_extract_json(blob_name=blob_name)
 
-        filtered_blobs = self._filter_files_by_date(blob_list, from_date=from_date, to_date=to_date)
+    def download_and_extract_json(self, blob_name: str, save_raw_json_indicator: bool | None = False,
+                                  download_file_path: str | None = None) -> dict:
 
-        return filtered_blobs
+        blob_client = self.blob_service_client.get_blob_client(container=self.container_name, blob=blob_name)
+        blob_data = blob_client.download_blob().readall()
+
+        if save_raw_json_indicator is True:
+            if download_file_path is None:
+                raise Exception('download_file_path= in .download_and_extract_json is not specified, cannot save file')
+            else:
+                with open(download_file_path, "wb") as download_file:
+                    download_file.write(blob_data)
+
+        with zipfile.ZipFile(io.BytesIO(blob_data)) as z:
+            for file_name in z.namelist():
+                with z.open(file_name) as json_file:
+                    json_data = json.load(json_file)
+                    pprint.pprint(json_data)
+                    print(type(json_data))
+                    time.sleep(1000)
+                    return json_data
+
+    @staticmethod
+    def _get_exact_download_directory(download_directory, market, stream_type, pair) -> str:
+        sub_market_stream_type_instrument_download_directory = (f'{download_directory}/{pair.lower()}/'
+                                                                f'{market.name.lower()}/{stream_type.name.lower()}')
+
+        if not os.path.exists(sub_market_stream_type_instrument_download_directory):
+            os.makedirs(sub_market_stream_type_instrument_download_directory)
+
+        return sub_market_stream_type_instrument_download_directory
 
     @staticmethod
     def _return_date_list(from_: str, to: str) -> List[str]:
@@ -63,11 +103,10 @@ class DataScaper:
 
         return date_list
 
-    @staticmethod
-    def _filter_files_by_date(file_list, from_date, to_date, file_duration_seconds: int = 60 * 30):
-        from_date = (datetime.strptime(from_date, '%d-%m-%YT%H:%M:%SZ')
-                     - timedelta(seconds=file_duration_seconds + 10))
-        to_date = datetime.strptime(to_date, '%d-%m-%YT%H:%M:%SZ')
+    def _filter_files_by_date(self, file_list, target_date):
+        from_date = (datetime.strptime(target_date, '%d-%m-%Y')
+                     - timedelta(seconds=self.single_file_duration_seconds + 10))
+        to_date = datetime.strptime(target_date, '%d-%m-%Y') + timedelta(days=1)
 
         filtered_files = []
 
@@ -100,17 +139,23 @@ class DataScaper:
         return f'{prefix}_{market_short_name}_{pair}'
 
     @staticmethod
-    def download_blob(blob_service_client, container_name, blob_name, download_file_path):
-        blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
-        with open(download_file_path, "wb") as download_file:
-            download_file.write(blob_client.download_blob().readall())
+    def str_date_timedelta(date_str: str, x: timedelta) -> str:
+        date_obj = datetime.strptime(date_str, '%d-%m-%Y')
+
+        previous_day = (date_obj + x).strftime('%d-%m-%Y')
+
+        previous_day_str = previous_day
+
+        return previous_day_str
 
 
 def download_data(download_directory: str, from_date: str, to_date: str, blob_connection_string: str,
                   container_name: str, pairs: List[str], markets: List[str], stream_types: List[str],
-                  file_duration_seconds: int | None = 60 * 30) -> None:
+                  single_file_duration_seconds: int, download_raw_jsons: bool | None = None) -> None:
 
-    data_scraper = DataScaper()
+    data_scraper = DataScaper(blob_connection_string=blob_connection_string, container_name=container_name,
+                              single_file_duration_seconds=single_file_duration_seconds,
+                              download_raw_jsons=download_raw_jsons)
 
     markets = [Market[_.upper()] for _ in markets]
     stream_types = [StreamType[_.upper()] for _ in stream_types]
@@ -122,8 +167,7 @@ def download_data(download_directory: str, from_date: str, to_date: str, blob_co
                 pair = f'{pair}_perp'
             for stream_type in stream_types:
                 thread = threading.Thread(target=data_scraper.download_daemon,
-                                          args=(download_directory, from_date, to_date, pair, market, stream_type,
-                                                blob_connection_string, container_name, file_duration_seconds))
+                                          args=(download_directory, from_date, to_date, pair, market, stream_type))
                 thread.start()
                 data_scraper.threads.append(thread)
 

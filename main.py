@@ -18,12 +18,15 @@ container_name = client.get_secret(container_name_secret_name).value
 
 download_data(
     download_directory='C:/Users/daniellasota/binance_data_main/',
-    from_date='15-06-2024T12:00:00Z',
-    to_date='16-06-2024T13:00:00Z',
+    from_date='20-06-2024',
+    to_date='21-06-2024',
     pairs=['BTCUSDT'],
-    markets=['SPOT', 'USD_M_FUTURES'],
-    stream_types=['ORDERBOOK', 'TRANSACTIONS'],
+    # markets=['SPOT', 'USD_M_FUTURES'],
+    markets=['SPOT'],
+    # stream_types=['ORDERBOOK', 'TRANSACTIONS', 'ORDERBOOK_SNAPSHOT'],
+    stream_types=['ORDERBOOK'],
     blob_connection_string=blob_connection_string,
     container_name=container_name,
-    file_duration_seconds=300
+    single_file_duration_seconds=300,
+    download_raw_jsons=True
 )

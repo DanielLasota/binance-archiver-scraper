@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Callable
 import os
 import io
 import pprint
@@ -13,23 +13,30 @@ import time
 import pandas as pd
 
 
-class DataScaper:
+class DataScraper:
     def __init__(
             self,
             blob_connection_string: str,
             container_name: str,
             single_file_duration_seconds: int,
-            download_raw_jsons: bool = False
+            save_raw_jsons_indicator: bool = False
     ):
         self.blob_service_client = BlobServiceClient.from_connection_string(blob_connection_string)
         self.container_client = self.blob_service_client.get_container_client(container_name)
         self.container_name = container_name
-        self.download_raw_jsons_indicator = download_raw_jsons
+        self.save_raw_jsons_indicator = save_raw_jsons_indicator
         self.single_file_duration_seconds = single_file_duration_seconds
         self.threads = []
 
     def download_daemon(self, download_directory: str, from_date: str, to_date: str, pair: str,
                         market: Market, stream_type: StreamType) -> None:
+
+        stream_processors: dict[StreamType, Callable[[List[str], str], pd.DataFrame]] = {
+            StreamType.DIFFERENCE_DEPTH: self.process_difference_depth_data,
+            StreamType.TRADE: self.process_trade_data,
+            StreamType.DEPTH_SNAPSHOT: self.process_depth_snapshot_data
+        }
+        processor = stream_processors.get(stream_type)
 
         for target_date in self._return_date_list(from_date, to_date):
             desired_blob_list = self.list_blob_for_specified_day(pair, target_date, market, stream_type)
@@ -38,123 +45,129 @@ class DataScaper:
             print(f'desired_blob_list for: {target_date}')
             pprint.pprint(desired_blob_list)
 
-            records = []
-            if stream_type == StreamType.ORDERBOOK:
-                for file_name in desired_blob_list:
-                    print(f'file_name: {file_name}')
-                    json_data = self.get_blob(blob_name=file_name,
-                                              save_raw_json_indicator=self.download_raw_jsons_indicator,
-                                              download_folder_path=f'{exact_directory}/raw_jsons')
+            df = processor(desired_blob_list, exact_directory)
 
-                    for record in json_data:
-                        event_time = record["data"]["E"]
-                        first_update = record["data"]["U"]
-                        final_update = record["data"]["u"]
-                        bids = record["data"]["b"]
-                        asks = record["data"]["a"]
-                        timestamp_of_receive = record["_E"]
+            print(df)
 
-                        for bid in bids:
-                            records.append([
-                                event_time,
-                                0,
-                                float(bid[0]),
-                                float(bid[1]),
-                                timestamp_of_receive,
-                                first_update,
-                                final_update
-                            ])
+            df.to_csv(f'{exact_directory}/'
+                      f'{pair}_{market.name.lower()}_{stream_type.name.lower()}_{target_date}.csv', index=False)
+            df = None
+            del df
 
-                        for ask in asks:
-                            records.append([
-                                event_time,
-                                1,
-                                float(ask[0]),
-                                float(ask[1]),
-                                timestamp_of_receive,
-                                first_update,
-                                final_update
-                            ])
-                    print(len(records))
+    def process_depth_snapshot_data(self, blob_list: List[str], exact_directory: str) -> pd.DataFrame:
+        ...
 
-                print('creating dataframe...')
+    def process_trade_data(self, blob_list: List[str], exact_directory: str) -> pd.DataFrame:
+        records = []
+        for file_name in blob_list:
+            print(f'file_name: {file_name}')
+            print(len(records))
+            json_data = self.get_blob(blob_name=file_name, download_folder_path=f'{exact_directory}/raw_jsons')
+            for record in json_data:
+                event_time = record["data"]["E"]
+                trade_id = record["data"]["t"]
+                price = record["data"]["p"]
+                quantity = record["data"]["q"]
+                # seller_order_id = record["data"]["a"] if "a" in record["data"] else None
+                # buyer_order_id = record["data"]["b"] if "b" in record["data"] else None
+                trade_time = record["data"]["T"]
+                is_buyer_market_maker = record["data"]["m"]
+                timestamp_of_receive = record["_E"]
 
-                df = pd.DataFrame(records, columns=[
-                    "EventTime",
-                    "IsAsk",
-                    "Price",
-                    "Quantity",
-                    "TimestampOfReceive",
-                    "FirstUpdate",
-                    "FinalUpdate"
-                ])
-                print(df)
+                records.append(
+                    [
+                        event_time,
+                        trade_id,
+                        price,
+                        quantity,
+                        # seller_order_id,
+                        # buyer_order_id,
+                        trade_time,
+                        int(is_buyer_market_maker),
+                        timestamp_of_receive
+                    ]
+                )
 
-                print('saving')
-                df.to_csv(f'{exact_directory}/{pair}_{market}_{stream_type}_{target_date}.csv', index=False)
-                time.sleep(10000)
+        print('creating dataframe...')
 
-            if stream_type == StreamType.TRANSACTIONS:
-                for file_name in desired_blob_list:
-                    print(f'file_name: {file_name}')
-                    json_data = self.get_blob(blob_name=file_name,
-                                              save_raw_json_indicator=self.download_raw_jsons_indicator,
-                                              download_folder_path=f'{exact_directory}/raw_jsons')
-                    for record in json_data:
-                        event_time = record["data"]["E"]
-                        trade_id = record["data"]["t"]
-                        price = record["data"]["p"]
-                        quantity = record["data"]["q"]
-                        # seller_order_id = record["data"]["a"]
-                        # buyer_order_id = record["data"]["b"]
-                        trade_time = record["data"]["T"]
-                        is_buyer_market_maker = record["data"]["m"]
-                        timestamp_of_receive = record["_E"]
+        columns = [
+            "EventTime",
+            "TradeId",
+            "Price",
+            "Quantity",
+            "TradeTime",
+            "IsBuyerMarketMaker",
+            "TimestampOfReceive"
+        ]
 
-                        records.append(
-                            [
-                                event_time,
-                                trade_id,
-                                price,
-                                quantity,
-                                # seller_order_id,
-                                # buyer_order_id,
-                                trade_time,
-                                is_buyer_market_maker,
-                                timestamp_of_receive
-                            ]
-                        )
+        df = pd.DataFrame(records, columns=columns)
+        return df
 
-                print('creating dataframe...')
+    def process_difference_depth_data(self, blob_list: List[str], exact_directory: str) -> pd.DataFrame:
+        records = []
+        for file_name in blob_list:
+            print(f'file_name: {file_name}')
+            print(len(records))
+            json_data = self.get_blob(blob_name=file_name, download_folder_path=f'{exact_directory}/raw_jsons')
 
-                df = pd.DataFrame(records, columns=[
-                    "EventTime",
-                    "TradeId",
-                    "Price",
-                    "Quantity",
-                    "TradeTime",
-                    "IsBuyerMarketMaker",
-                    "TimestampOfReceive"
-                ])
-                print(df)
-                print('saving')
-                df.to_csv(f'{exact_directory}/'
-                          f'{pair}_{market.name.lower()}_{stream_type.name.lower()}_{target_date}.csv')
-                time.sleep(10000)
+            for record in json_data:
+                event_time = record["data"]["E"]
+                first_update = record["data"]["U"]
+                final_update = record["data"]["u"]
+                bids = record["data"]["b"]
+                asks = record["data"]["a"]
+                timestamp_of_receive = record["_E"]
 
-    def get_blob(self, blob_name: str, save_raw_json_indicator: bool | None = False,
-                 download_folder_path: str | None = None) -> dict:
+                for bid in bids:
+                    records.append([
+                        event_time,
+                        0,
+                        float(bid[0]),
+                        float(bid[1]),
+                        timestamp_of_receive,
+                        first_update,
+                        final_update
+                    ])
+
+                for ask in asks:
+                    records.append([
+                        event_time,
+                        1,
+                        float(ask[0]),
+                        float(ask[1]),
+                        timestamp_of_receive,
+                        first_update,
+                        final_update
+                    ])
+            print(len(records))
+
+        print('creating dataframe...')
+
+        columns = [
+            "EventTime",
+            "IsAsk",
+            "Price",
+            "Quantity",
+            "TimestampOfReceive",
+            "FirstUpdate",
+            "FinalUpdate"
+        ]
+
+        df = pd.DataFrame(records, columns=columns)
+        return df
+
+    def get_blob(self, blob_name: str, download_folder_path: str | None = None) -> dict:
 
         blob_client = self.blob_service_client.get_blob_client(container=self.container_name, blob=blob_name)
         blob_data = blob_client.download_blob().readall()
 
-        if save_raw_json_indicator is True:
+        if self.save_raw_jsons_indicator is True:
             if download_folder_path is None:
                 raise Exception('download_file_path= in .download_and_extract_json is not specified, cannot save file')
             else:
-                if not os.path.exists(download_folder_path):
-                    os.makedirs(download_folder_path)
-                download_file_path = f'{download_folder_path}/{blob_name}'
+                if not os.path.exists(f'{download_folder_path}/raw_data'):
+                    os.makedirs(f'{download_folder_path}/raw_data')
+                download_file_path = f'{download_folder_path}/raw_data/{blob_name}'
                 with open(download_file_path, "wb") as download_file:
                     download_file.write(blob_data)
 
@@ -164,7 +177,8 @@ class DataScaper:
                     json_file = json.load(json_file)
                     return json_file
 
-    def list_blob_for_specified_day(self, pair: str, target_date: str, market: Market, stream_type: StreamType) -> List[str]:
+    def list_blob_for_specified_day(self, pair: str, target_date: str, market: Market,
+                                    stream_type: StreamType) -> List[str]:
 
         prefix = self._get_file_name_prefix(pair, market, stream_type)
         from_date_minus_one_day = self.str_date_timedelta(target_date, timedelta(days=-1))
@@ -199,13 +213,16 @@ class DataScaper:
 
     @staticmethod
     def _get_exact_download_directory(download_directory, market, stream_type, pair) -> str:
+        # sub_market_stream_type_instrument_download_directory = (f'{download_directory}/{pair.lower()}/'
+        #                                                         f'{market.name.lower()}/{stream_type.name.lower()}')
+
         sub_market_stream_type_instrument_download_directory = (f'{download_directory}/{pair.lower()}/'
                                                                 f'{market.name.lower()}/{stream_type.name.lower()}')
 
-        if not os.path.exists(sub_market_stream_type_instrument_download_directory):
-            os.makedirs(sub_market_stream_type_instrument_download_directory)
+        # if not os.path.exists(sub_market_stream_type_instrument_download_directory):
+        #     os.makedirs(sub_market_stream_type_instrument_download_directory)
 
-        return sub_market_stream_type_instrument_download_directory
+        return download_directory
 
     @staticmethod
     def _return_date_list(from_: str, to: str) -> List[str]:
@@ -229,9 +246,9 @@ class DataScaper:
         }
 
         data_type_mapping = {
-            StreamType.ORDERBOOK: 'binance_l2lob_delta_broadcast',
-            StreamType.ORDERBOOK_SNAPSHOT: 'binance_l2lob_snapshot',
-            StreamType.TRANSACTIONS: 'binance_transaction_broadcast'
+            StreamType.DIFFERENCE_DEPTH: 'binance_l2lob_delta_broadcast',
+            StreamType.DEPTH_SNAPSHOT: 'binance_l2lob_snapshot',
+            StreamType.TRADE: 'binance_transaction_broadcast'
         }
 
         market_short_name = market_mapping.get(market, 'unknown_market')
@@ -254,9 +271,9 @@ def download_data(download_directory: str, from_date: str, to_date: str, blob_co
                   container_name: str, pairs: List[str], markets: List[str], stream_types: List[str],
                   single_file_duration_seconds: int, save_raw_jsons: bool | None = None) -> None:
 
-    data_scraper = DataScaper(blob_connection_string=blob_connection_string, container_name=container_name,
-                              single_file_duration_seconds=single_file_duration_seconds,
-                              download_raw_jsons=save_raw_jsons)
+    data_scraper = DataScraper(blob_connection_string=blob_connection_string, container_name=container_name,
+                               single_file_duration_seconds=single_file_duration_seconds,
+                               save_raw_jsons_indicator=save_raw_jsons)
 
     markets = [Market[_.upper()] for _ in markets]
     stream_types = [StreamType[_.upper()] for _ in stream_types]
@@ -283,7 +300,3 @@ def download_data(download_directory: str, from_date: str, to_date: str, blob_co
                 #     container_name=container_name,
                 #     file_duration_seconds=file_duration_seconds
                 #     )
-'''
-40*40 * pi = 1600 pi
-60*60 pi = 3600 pi = 10.048
-'''

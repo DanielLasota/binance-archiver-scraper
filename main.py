@@ -24,7 +24,7 @@ download_data(
     # markets=['SPOT', 'USD_M_FUTURES'],
     markets=['SPOT'],
     # stream_types=['ORDERBOOK', 'TRANSACTIONS', 'ORDERBOOK_SNAPSHOT'],
-    stream_types=['TRANSACTIONS'],
+    stream_types=['DIFFERENCE_DEPTH'],
     blob_connection_string=blob_connection_string,
     container_name=container_name,
     single_file_duration_seconds=300,
